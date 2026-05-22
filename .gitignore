@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.egg-info/
+*.egg
+dist/
+build/
+*.spec
+
+# Virtual environments
+venv/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# App data (user-specific, don't commit)
+# ~/.smart_clipboard/ is created at runtime
+
+# Logs
+*.log
