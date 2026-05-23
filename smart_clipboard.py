@@ -7,6 +7,8 @@ import sys
 import os
 import sqlite3
 import time
+import ctypes
+from ctypes import wintypes
 from datetime import datetime
 
 from PyQt5.QtWidgets import (
@@ -184,10 +186,20 @@ def paste_content(widget, content: str, show_after: bool = False) -> None:
     # ================================================================
 
 
-def build_item_widget(lines: list, item_height: int = 60) -> QWidget:
+def build_item_widget(lines: list, item_height: int = 60, bg_color: str = '') -> QWidget:
     """构建 QListWidget 的自定义项 widget，内容垂直居中"""
     widget = QWidget()
     widget.setMinimumHeight(item_height)
+    # 如果有自定义背景色，设置圆角背景
+    if bg_color:
+        widget.setStyleSheet(f"""
+            QWidget {{
+                background-color: {bg_color};
+                border: 1px solid rgba(0, 0, 0, 0.08);
+                border-radius: 10px;
+                margin: 2px 4px;
+            }}
+        """)
     layout = QVBoxLayout(widget)
     layout.setContentsMargins(14, 6, 14, 6)
     layout.setSpacing(2)
@@ -222,25 +234,29 @@ class StorageManager:
                 CREATE TABLE IF NOT EXISTS favorites (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     content TEXT NOT NULL, category TEXT DEFAULT 'default',
-                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    color TEXT DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS memos (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     title TEXT NOT NULL, content TEXT NOT NULL,
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                    remind_time TEXT
+                    remind_time TEXT,
+                    color TEXT DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS clipboard_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     content TEXT NOT NULL, timestamp TEXT NOT NULL,
-                    is_favorite INTEGER DEFAULT 0
+                    is_favorite INTEGER DEFAULT 0,
+                    color TEXT DEFAULT ''
                 );
             ''')
-            # 迁移：为旧 memos 表添加 remind_time 列
-            try:
-                conn.execute("ALTER TABLE memos ADD COLUMN remind_time TEXT")
-            except Exception:
-                pass
+            # 迁移：为旧表添加 color 列
+            for table in ('favorites', 'memos', 'clipboard_history'):
+                try:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN color TEXT DEFAULT ''")
+                except Exception:
+                    pass
 
     @staticmethod
     def _now() -> str:
@@ -328,6 +344,13 @@ class StorageManager:
     def delete_history_item(self, item_id: int):
         self._query("DELETE FROM clipboard_history WHERE id=?", (item_id,))
 
+    def set_item_color(self, item_type: str, item_id: int, color: str):
+        """设置条目的背景颜色"""
+        table_map = {"clipboard": "clipboard_history", "favorite": "favorites", "memo": "memos"}
+        table = table_map.get(item_type)
+        if table:
+            self._query(f"UPDATE {table} SET color=? WHERE id=?", (color, item_id))
+
     def clear_history(self):
         self._query("DELETE FROM clipboard_history")
 
@@ -396,74 +419,76 @@ class SingleInstance:
 
 
 # ============================================================
-# 全局快捷键监听
+# 全局快捷键监听 - 使用 keyboard 库（支持 suppress 拦截）
 # ============================================================
 class HotkeyListener(QObject):
-    """Alt+Q 全局快捷键监听"""
+    """Alt+Q / Alt+W 全局快捷键监听 - 使用 keyboard 库"""
     toggle_requested = pyqtSignal()
     favorites_requested = pyqtSignal()
 
     def __init__(self, callback, favorites_callback=None):
         super().__init__()
-        self.listener = None
-        self.alt_pressed = False
-        self._last_trigger_time = 0  # 上次触发时间戳
-        self._debounce_ms = 300  # 防抖动间隔 300ms
         self.toggle_requested.connect(callback)
         if favorites_callback:
             self.favorites_requested.connect(favorites_callback)
+        
+        self._hotkey_thread = None
+        self._running = False
 
-    def _reset_hotkey_lock(self):
-        """重置快捷键锁（供QTimer调用）"""
-        pass  # 简化后不再需要，但保留方法避免报错
+    def _hotkey_loop(self):
+        """在独立线程中运行热键监听"""
+        try:
+            import keyboard
+            
+            # 注册 Alt+Q - suppress=True 表示拦截热键，不传递给其他程序
+            keyboard.add_hotkey('alt+q', self._on_toggle, suppress=True, trigger_on_release=False)
+            
+            # 注册 Alt+W
+            keyboard.add_hotkey('alt+w', self._on_favorites, suppress=True, trigger_on_release=False)
+            
+            # 保持线程运行
+            while self._running:
+                time.sleep(0.1)
+                
+        except Exception as e:
+            print(f"热键监听错误: {e}")
+
+    def _on_toggle(self):
+        """Alt+Q 回调"""
+        self.toggle_requested.emit()
+
+    def _on_favorites(self):
+        """Alt+W 回调"""
+        self.favorites_requested.emit()
 
     def start(self) -> bool:
+        """启动热键监听"""
         try:
-            from pynput import keyboard
-
-            def on_press(key):
-                try:
-                    # 防抖动检查：只使用简单的时间戳比较
-                    import time as _time
-                    _now = _time.time() * 1000
-                    if (_now - self._last_trigger_time) < self._debounce_ms:
-                        return
-
-                    if key in (keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r):
-                        self.alt_pressed = True
-                    elif self.alt_pressed:
-                        char = getattr(key, 'char', None)
-                        if char and char.lower() == 'q':
-                            self._last_trigger_time = _now
-                            self.alt_pressed = False  # 立即重置，防止重复触发
-                            self.toggle_requested.emit()
-                        elif char and char.lower() == 'w':
-                            self._last_trigger_time = _now
-                            self.alt_pressed = False  # 立即重置，防止重复触发
-                            self.favorites_requested.emit()
-                except Exception:
-                    pass
-
-            def on_release(key):
-                try:
-                    if key in (keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r):
-                        self.alt_pressed = False
-                except Exception:
-                    pass
-
-            self.listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-            self.listener.start()
+            self._running = True
+            
+            # 在后台线程中运行热键监听
+            import threading
+            self._hotkey_thread = threading.Thread(target=self._hotkey_loop, daemon=True)
+            self._hotkey_thread.start()
+            
             return True
         except Exception as e:
-            print(f"快捷键监听启动失败: {e}")
+            print(f"热键监听启动失败: {e}")
             return False
 
     def stop(self):
-        if self.listener:
-            try:
-                self.listener.stop()
-            except Exception:
-                pass
+        """停止热键监听"""
+        self._running = False
+        
+        try:
+            import keyboard
+            keyboard.unhook_all()
+        except:
+            pass
+        
+        # 等待线程结束
+        if self._hotkey_thread and self._hotkey_thread.is_alive():
+            self._hotkey_thread.join(timeout=1.0)
 
 
 # ============================================================
@@ -724,16 +749,19 @@ class FloatingWindow(QWidget):
         self.list_widget.clear()
         if self.current_mode == "clipboard":
             for item in self.storage.get_history(50):
-                self._add_list_item(item['content'], item['timestamp'], item['id'], "clipboard")
+                self._add_list_item(item['content'], item['timestamp'], item['id'], "clipboard",
+                                    item.get('color', ''))
         elif self.current_mode == "favorites":
             for item in self.storage.get_favorites():
-                self._add_list_item(item['content'], item['created_at'], item['id'], "favorite")
+                self._add_list_item(item['content'], item['created_at'], item['id'], "favorite",
+                                    item.get('color', ''))
         elif self.current_mode == "memos":
             for item in self.storage.get_memos():
                 self._add_memo_item(item['title'], item['content'], item['id'],
-                                    item.get('remind_time'))
+                                    item.get('remind_time'), item.get('color', ''))
 
-    def _add_list_item(self, content: str, timestamp: str, item_id: int, item_type: str):
+    def _add_list_item(self, content: str, timestamp: str, item_id: int, item_type: str,
+                       bg_color: str = ''):
         display = content.replace('\n', ' ')
         if len(display) > 60:
             display = display[:60] + "..."
@@ -741,18 +769,21 @@ class FloatingWindow(QWidget):
         item.setData(Qt.ItemDataRole.UserRole, content)
         item.setData(Qt.ItemDataRole.UserRole + 1, item_id)
         item.setData(Qt.ItemDataRole.UserRole + 2, item_type)
+        item.setData(Qt.ItemDataRole.UserRole + 3, bg_color)
         w = build_item_widget([
             (display, "color: #1a3a2a; font-size: 16px;"),
-        ])
+        ], bg_color=bg_color)
         item.setSizeHint(QSize(400, 56))
         self.list_widget.addItem(item)
         self.list_widget.setItemWidget(item, w)
 
-    def _add_memo_item(self, title: str, content: str, memo_id: int, remind_time: str = None):
+    def _add_memo_item(self, title: str, content: str, memo_id: int,
+                       remind_time: str = None, bg_color: str = ''):
         item = QListWidgetItem()
         item.setData(Qt.ItemDataRole.UserRole, content)
         item.setData(Qt.ItemDataRole.UserRole + 1, memo_id)
         item.setData(Qt.ItemDataRole.UserRole + 2, "memo")
+        item.setData(Qt.ItemDataRole.UserRole + 3, bg_color)
         preview = content.replace('\n', ' ')
         if len(preview) > 50:
             preview = preview[:50] + "..."
@@ -763,7 +794,7 @@ class FloatingWindow(QWidget):
         if remind_time:
             lines.append((f"⏰ 今天 {remind_time}", "color: #e67e22; font-size: 14px;"))
         item_height = 82 if remind_time else 60
-        w = build_item_widget(lines, item_height)
+        w = build_item_widget(lines, item_height, bg_color=bg_color)
         item.setSizeHint(QSize(400, item_height))
         self.list_widget.addItem(item)
         self.list_widget.setItemWidget(item, w)
@@ -777,16 +808,18 @@ class FloatingWindow(QWidget):
         if self.current_mode == "clipboard":
             for item in self.storage.get_history(200):
                 if t in item['content'].lower():
-                    self._add_list_item(item['content'], item['timestamp'], item['id'], "clipboard")
+                    self._add_list_item(item['content'], item['timestamp'], item['id'], "clipboard",
+                                        item.get('color', ''))
         elif self.current_mode == "favorites":
             for item in self.storage.get_favorites():
                 if t in item['content'].lower():
-                    self._add_list_item(item['content'], item['created_at'], item['id'], "favorite")
+                    self._add_list_item(item['content'], item['created_at'], item['id'], "favorite",
+                                        item.get('color', ''))
         elif self.current_mode == "memos":
             for item in self.storage.get_memos():
                 if t in item['title'].lower() or t in item['content'].lower():
                     self._add_memo_item(item['title'], item['content'], item['id'],
-                                        item.get('remind_time'))
+                                        item.get('remind_time'), item.get('color', ''))
 
     def _on_item_clicked(self, item: QListWidgetItem):
         content = item.data(Qt.ItemDataRole.UserRole)
@@ -933,6 +966,18 @@ class PinnedItemWindow(QDialog):
     """单条内容钉出小窗口"""
     _active_windows = []
     _keyboard = None
+    
+    # 预设颜色方案: (名称, 背景色rgba, 边框色rgba)
+    COLOR_PRESETS = [
+        ("🟢 薄荷绿", "rgba(220, 245, 225, 230)", "rgba(60, 179, 113, 0.7)"),
+        ("🔵 天空蓝", "rgba(220, 240, 255, 230)", "rgba(70, 130, 180, 0.7)"),
+        ("🟡 柠檬黄", "rgba(255, 250, 205, 230)", "rgba(218, 165, 32, 0.7)"),
+        ("🟠 蜜桃橙", "rgba(255, 228, 196, 230)", "rgba(210, 105, 30, 0.7)"),
+        ("🔴 樱花粉", "rgba(255, 220, 230, 230)", "rgba(220, 20, 60, 0.7)"),
+        ("🟣 薰衣草", "rgba(230, 220, 245, 230)", "rgba(128, 0, 128, 0.7)"),
+        ("⚪ 珍珠白", "rgba(245, 245, 245, 230)", "rgba(128, 128, 128, 0.7)"),
+        ("⚫ 暗夜灰", "rgba(60, 60, 60, 230)", "rgba(100, 100, 100, 0.7)"),
+    ]
 
     def __init__(self, content: str, parent=None):
         super().__init__(parent, Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
@@ -940,6 +985,8 @@ class PinnedItemWindow(QDialog):
         self.content = content
         self._drag_pos = None
         self._is_pasting = False
+        self._current_bg_color = self.COLOR_PRESETS[0][1]  # 默认第一个颜色
+        self._current_border_color = self.COLOR_PRESETS[0][2]
         self._init_ui()
         self._apply_style()
 
@@ -959,22 +1006,27 @@ class PinnedItemWindow(QDialog):
         self.setFixedSize(220, 100)
 
         # Create container for styled background
-        container = QFrame(self)
-        container.setObjectName("pinnedContainer")
-        container.setGeometry(0, 0, 220, 100)
+        self.container = QFrame(self)
+        self.container.setObjectName("pinnedContainer")
+        self.container.setGeometry(0, 0, 220, 100)
+        
+        # 启用右键菜单
+        self.container.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.container.customContextMenuRequested.connect(self._show_context_menu)
 
-        layout = QVBoxLayout(container)
+        layout = QVBoxLayout(self.container)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
 
         self.content_btn = QPushButton(self._truncate_content(self.content, 40))
         self.content_btn.setObjectName("contentBtn")
+        self.content_btn.setFixedHeight(36)
         tooltip_text = "点击粘贴: " + self.content[:100]
         if len(self.content) > 100:
             tooltip_text += "..."
         self.content_btn.setToolTip(tooltip_text)
         self.content_btn.clicked.connect(self._on_paste)
-        layout.addWidget(self.content_btn)
+        layout.addWidget(self.content_btn, alignment=Qt.AlignmentFlag.AlignCenter)
 
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(8)
@@ -996,55 +1048,79 @@ class PinnedItemWindow(QDialog):
         # Add container to dialog's main layout
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.addWidget(container)
+        main_layout.addWidget(self.container)
+    
+    def _show_context_menu(self, position):
+        """显示右键菜单 - 选择背景颜色"""
+        menu = QMenu(self)
+        menu.setStyleSheet(MENU_STYLE)
+        
+        # 添加标题
+        title_action = menu.addAction("🎨 选择背景颜色")
+        title_action.setEnabled(False)
+        menu.addSeparator()
+        
+        # 添加颜色选项
+        for name, bg_color, border_color in self.COLOR_PRESETS:
+            action = menu.addAction(name)
+            action.triggered.connect(lambda checked, b=bg_color, bd=border_color: self._set_color(b, bd))
+        
+        menu.exec(self.container.mapToGlobal(position))
+    
+    def _set_color(self, bg_color, border_color):
+        """设置窗口背景颜色"""
+        self._current_bg_color = bg_color
+        self._current_border_color = border_color
+        self._apply_style()
 
     def _apply_style(self):
-        self.setStyleSheet("""
-            QDialog {
+        # 根据当前颜色动态生成样式
+        self.setStyleSheet(f"""
+            QDialog {{
                 background: transparent;
                 border: none;
-            }
-            #pinnedContainer {
-                background-color: rgba(220, 245, 225, 230);
-                border: 2px solid rgba(60, 179, 113, 0.7);
+            }}
+            #pinnedContainer {{
+                background-color: {self._current_bg_color};
+                border: 2px solid {self._current_border_color};
                 border-radius: 12px;
-            }
-            #contentBtn {
+            }}
+            #contentBtn {{
                 background-color: rgba(255, 255, 255, 0.55);
                 border: 1px solid rgba(120, 200, 140, 0.5);
                 border-radius: 8px;
-                padding: 8px 12px;
+                padding: 0px 12px;
                 color: #1a3a2a;
                 font-size: 13px;
-                text-align: left;
-            }
-            #contentBtn:hover {
+                text-align: center;
+            }}
+            #contentBtn:hover {{
                 background-color: rgba(255, 255, 255, 0.75);
                 border: 1px solid rgba(60, 179, 113, 0.7);
-            }
-            #smallBtn {
+            }}
+            #smallBtn {{
                 background-color: rgba(255, 255, 255, 0.45);
                 border: 1px solid rgba(120, 200, 140, 0.4);
                 border-radius: 6px;
                 padding: 4px 10px;
                 color: #2d5a3d;
                 font-size: 11px;
-            }
-            #smallBtn:hover {
+            }}
+            #smallBtn:hover {{
                 background-color: rgba(255, 255, 255, 0.65);
-            }
-            #closeBtn {
+            }}
+            #closeBtn {{
                 background-color: rgba(220, 80, 80, 0.4);
                 border: none;
                 border-radius: 6px;
                 color: #b03030;
                 font-size: 12px;
                 font-weight: bold;
-            }
-            #closeBtn:hover {
+            }}
+            #closeBtn:hover {{
                 background-color: rgba(220, 80, 80, 0.7);
                 color: #ffffff;
-            }
+            }}
         """)
 
     def _truncate_content(self, content: str, max_len: int) -> str:
@@ -1564,6 +1640,17 @@ class TimePickerDialog(QDialog):
 class ListContextMenu(QMenu):
     """列表项右键上下文菜单"""
 
+    # 预设颜色方案: (名称, 背景色)
+    COLOR_PRESETS = [
+        ("🚫 无颜色", ""),
+        ("🟢 薄荷绿", "rgba(200, 240, 210, 200)"),
+        ("🔵 天空蓝", "rgba(200, 230, 255, 200)"),
+        ("🟡 柠檬黄", "rgba(255, 248, 190, 200)"),
+        ("🟠 蜜桃橙", "rgba(255, 225, 190, 200)"),
+        ("🔴 樱花粉", "rgba(255, 215, 225, 200)"),
+        ("🟣 薰衣草", "rgba(225, 215, 245, 200)"),
+    ]
+
     def __init__(self, storage: StorageManager, list_widget, floating_window, parent=None):
         super().__init__(parent)
         self.storage = storage
@@ -1581,6 +1668,12 @@ class ListContextMenu(QMenu):
         self.addAction("📋 复制到剪贴板").triggered.connect(lambda: QApplication.clipboard().setText(content))
         self.addAction("📌 钉出到小窗口").triggered.connect(lambda: self._pin_item(content))
 
+        # 颜色子菜单
+        color_menu = self.addMenu("🎨 设置颜色")
+        for name, color in self.COLOR_PRESETS:
+            action = color_menu.addAction(name)
+            action.triggered.connect(lambda checked, c=color, it=item, t=item_type, i=item_id: self._set_item_color(c, it, t, i))
+
         if item_type == "clipboard":
             if self.storage.is_favorite(content):
                 self.addAction("💔 取消收藏").triggered.connect(lambda: self._remove_favorite(content))
@@ -1595,6 +1688,13 @@ class ListContextMenu(QMenu):
             self.addAction("🗑️ 删除").triggered.connect(lambda: self._remove_memo(item_id))
 
         self.exec_(pos)
+
+    def _set_item_color(self, color: str, item: QListWidgetItem, item_type: str, item_id: int):
+        """设置条目背景颜色"""
+        # 保存到数据库
+        self.storage.set_item_color(item_type, item_id, color)
+        # 更新当前显示
+        self.floating_window.refresh()
 
     def _add_favorite(self, content: str):
         self.storage.add_favorite(content)
