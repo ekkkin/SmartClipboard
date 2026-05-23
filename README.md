@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-> 一个优雅的 Windows 悬浮剪切板工具，支持剪切板历史、收藏、备忘录和钉出窗口，
+> Windows 悬浮剪切板工具，支持剪切板历史、收藏、备忘录和钉出窗口，
 > **专为 RDP 远程桌面环境优化**，在远程会话中也能快速粘贴。
 
 ![预览图](docs/preview.png)
